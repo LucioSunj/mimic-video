@@ -1,0 +1,7 @@
+model/checkpoints
+eval/*/results
+nohup.out
+uv.lock
+
+__pycache__/
+.venv/
