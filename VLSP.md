@@ -304,4 +304,73 @@ condition/mode_id, condition/shuffle_enabled
   (`distributed_parallelism="ddp"`, `fsdp_shard_size=0`) is unaffected. If you
   enable FSDP, add explicit gradient synchronization for the source prior or
   wrap it in its own FSDP unit.
-```
+
+## 10. Related work & design rationale
+
+VLSP's core idea — replacing the Gaussian flow source with an informative,
+video-conditioned source — is shared by two recent action flow-matching works.
+Reading their code directly shaped several VLSP design decisions.
+
+### A2A — Action-to-Action Flow Matching (RoboVerse)
+- Flows from a **history encoding** (past states/actions → latent, the source)
+  to **future-action latents** (target), with visual obs as a *separate*
+  `global_cond`.
+- Configurable-source interface (`flow_matchers.py`):
+  `x0 = randn_like(target) if start is None else start` — the source is just an
+  optional non-Gaussian `start`.
+- *A2A-Noise* injects Gaussian noise into the history **states** before encoding,
+  as a robustness regularizer.
+- Anti-degeneracy: action-reconstruction + consistency + InfoNCE contrastive losses.
+
+### VITA — Vision-to-Action Flow Matching Policy (ICLR 2026, arXiv:2507.13231)
+- **"noise-free, conditioning-free"**: the flow `start` is the **vision latent
+  itself** (`start = obs_encoder(vision)`, a single `nn.Linear` to `latent_dim`);
+  the target is the **action-AE latent** (same dim); and the flow net
+  `model(x_t, t)` takes **no condition**. The flowed latent is decoded back to
+  actions at the end.
+- Both endpoints live in an **aligned latent space** (vision ↔ action manifolds),
+  so a short MLP flow suffices — *"conventional flow matching may struggle to
+  transport from an unstructured Gaussian to a structured action space."*
+- Anti-degeneracy: action reconstruction (encoder + flow), InfoNCE contrastive
+  (vision↔action), consistency, optional action-VAE KL.
+
+### How VLSP relates / differs
+
+| | A2A | VITA | VLSP (this work) |
+|---|---|---|---|
+| flow space | action-AE latent | aligned vision/action latent | **raw normalized action space** (`x0` = GT action) |
+| source | history encoding | vision latent (`Linear`) | **video latent → prior net** (mean/attention/perceiver pooling, optional diagonal Gaussian) |
+| video as condition | yes (`global_cond`) | no (conditioning-free) | **configurable** (`action_conditioning`: normal / zero_video / …) |
+| anti-collapse | recon + contrastive + consistency | recon + contrastive + consistency + KL | optional KL / mean-L2 / std (default 0) |
+| action autoencoder | yes | yes | **no** (flow directly in action space, like mimic-video) |
+
+**Design notes / consequences**
+
+1. **A learned source map is unavoidable.** The video latent `[B, N, 2048]` and the
+   action source `[B, HA, A]` differ in both shape and space, while
+   `x_t = (1-t)·x0 + t·source` requires the source to match `x0`. VITA's
+   `obs_encoder` (a `Linear`) and A2A's history encoder are the same unavoidable
+   bridge — VLSP's `VideoLatentSourcePrior` is our analog. The minimal,
+   VITA-like form is `source_mode=video_prior_mean` + `pool_type=mean`
+   (deterministic projection, no sampling).
+2. **VITA-style recipe in VLSP.** `source_mode=video_prior_mean` +
+   `action_conditioning=zero_video` reproduces VITA's *source-only,
+   conditioning-free* setup (experiment row D), here in raw action space.
+3. **Source collapse.** Because our source is trainable and `x0` is the fixed GT
+   action, the flow loss admits a degenerate optimum `source → x0 ⇒ u_t → 0` that
+   bypasses the DiT. A2A/VITA prevent this with reconstruction / contrastive /
+   consistency anchoring (and VITA deliberately *aligns* source≈target while
+   keeping both decodable). VLSP currently offers KL / mean-L2 / std regularizers
+   (default 0). **Recommendation**: for `video_prior_*` modes set a small
+   `kl_weight` (e.g. `1e-3`) and watch `source/source_vs_x0_mse`; an optional
+   VITA-style consistency anchor is a natural extension.
+4. **Endpoint convention.** A2A/VITA (torchcfm) put the source at `t=0` and data
+   at `t=1`; mimic-video puts data at `t=0` and the source at `t=1` (the sampler
+   integrates `t: 1→0`). VLSP places the learned source at mimic-video's `t=1`
+   endpoint — exactly where `torch.randn_like(action)` used to be — so the
+   existing sampler/integration is unchanged.
+
+### References
+- **VITA: Vision-to-Action Flow Matching Policy**, ICLR 2026 — arXiv:[2507.13231](https://arxiv.org/abs/2507.13231) · code: https://github.com/ucd-dare/VITA (`flare/policies/vita/vita_policy.py`, `flare/flow/flow_matchers.py`)
+- **A2A — Action-to-Action Flow Matching** (RoboVerse): https://github.com/JIAjindou/A2A_Flow_Matching (`roboverse_learn/il/policies/a2a/`)
+- **MeanFlow** (1-step generative modeling) arXiv:[2505.13447](https://arxiv.org/abs/2505.13447); **Improved Mean Flows** arXiv:2512.02012 — flow-matcher options used by A2A/VITA.
