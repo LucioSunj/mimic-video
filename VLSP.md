@@ -374,3 +374,76 @@ Reading their code directly shaped several VLSP design decisions.
 - **VITA: Vision-to-Action Flow Matching Policy**, ICLR 2026 — arXiv:[2507.13231](https://arxiv.org/abs/2507.13231) · code: https://github.com/ucd-dare/VITA (`flare/policies/vita/vita_policy.py`, `flare/flow/flow_matchers.py`)
 - **A2A — Action-to-Action Flow Matching** (RoboVerse): https://github.com/JIAjindou/A2A_Flow_Matching (`roboverse_learn/il/policies/a2a/`)
 - **MeanFlow** (1-step generative modeling) arXiv:[2505.13447](https://arxiv.org/abs/2505.13447); **Improved Mean Flows** arXiv:2512.02012 — flow-matcher options used by A2A/VITA.
+
+## 11. Experiment protocol & order (go/no-go)
+
+Run experiments **cheapest-to-validate / most-decisive first**, with a go/no-go
+gate between phases. The letters (A–K) refer to the matrix in §5; the names are
+the registered experiments from §6.
+
+### Phase 0 — Plumbing / sanity (cheap, do first, don't skip)
+1. `cd model && python -m scripts.debug_vlsp` (the CPU smoke test).
+2. Short runs (a few hundred–1k steps, no convergence needed):
+   - `vlsp_baseline_gaussian` — confirm the baseline trains **and matches the
+     original mimic-video numbers** (regression check: VLSP disabled must be
+     bit-identical to upstream).
+   - `vlsp_source_condition_sample` — confirm the source-prior path trains: loss
+     decreases, all `source/*` + `loss/*` metrics log, checkpoint save/load
+     round-trips, no DDP unused-parameter error.
+   - `vlsp_debug_gt_action_noisy` — near-oracle source; confirm the decoder can
+     overfit (sanity that the pipeline itself is healthy).
+- **Gate:** all three short runs healthy → Phase 1. Otherwise fix plumbing first.
+
+### Phase 1 — Baseline (the anchor number)
+3. Full train + eval `vlsp_baseline_gaussian` (LIBERO/Bridge). **Lock the
+   seed / dataset / compute / eval protocol here**; every later run reuses it.
+
+### Phase 2 — Core hypothesis: does the video-latent source help? (min. 2 runs)
+4. `vlsp_source_condition_sample` (**C** = video source + normal condition).
+   - **C vs A**: only the source differs (both keep the video condition) ⇒ the
+     cleanest "does the video-latent source add value" comparison. **Primary result.**
+5. `vlsp_source_only_sample` (**B** = video source + `zero_video`).
+   - **B vs A**: can the source *replace* the cross-attention condition (stronger
+     claim). **B vs C**: how much the condition still contributes given the source.
+- **Gate:** if C shows no meaningful gain over A, do **not** start sweeps — go to
+  Phase 4 (kl / determinism) to understand why (likely collapse or a too-weak prior).
+
+### Phase 3 — Negative controls (prove it's signal, not capacity) — run as soon as C looks positive
+6. `vlsp_shuffled_source` (**F** = source from batch-shuffled video).
+   - If **F ≈ C**, the gain is just extra params / a smaller-variance source / a
+     loss-scale artifact — **not** video information. **Stop and rethink.**
+7. `vlsp_shuffled_condition` (**G**) — controls the conditioning pathway.
+- **Gate:** controls **must** degrade vs C/A. If they don't, do not proceed to sweeps.
+
+### Phase 4 — Mechanism ablations + the collapse dial
+8. **Deterministic vs stochastic**: `vlsp_source_only_mean` / `vlsp_source_condition_mean`
+   (**D/E**) vs B/C — does the reparameterized noise matter? (`mean` ≈ VITA-style.)
+9. **kl dial**: sweep `kl_weight ∈ {0, 1e-3, 1e-2}` on the best config while watching
+   `source/source_vs_x0_mse`. This characterizes whether the source is a *hint*
+   (mse stays up; DiT does the work) or *the answer* (mse → 0; DiT bypassed).
+
+### Phase 5 — Sweeps (lowest priority; only after Phases 2–3 are positive)
+10. On the winning config: blend `α∈{.25,.5,.75}` (**H**), dropout `p∈{.1,.2,.5}`
+    (**J**), residual scale (**I**), temperature (**K**), pooling
+    (`mean|attention|perceiver`). These are tuning, not validation of the claim.
+
+### Minimal decisive set (if compute is tight): **A · C · B · F**
+`vlsp_baseline_gaussian` · `vlsp_source_condition_sample` · `vlsp_source_only_sample`
+· `vlsp_shuffled_source`. These four answer the core question: *does the
+video-latent source help, and is it real (video) information?* Everything else is
+a bonus.
+
+### Discipline (applies to every run)
+- **Same seed / dataset / compute / eval protocol**; vary only the axis under test.
+- **Do NOT compare runs on the raw flow loss** (`loss/flow`). The baseline regresses
+  `noise − x0` while VLSP regresses `source − x0`, so their loss magnitudes are not
+  comparable — a smaller VLSP loss can be pure scale, not better learning. Compare on
+  **scale-invariant, source-independent metrics**: the unnormalized action prediction
+  MSE after full sampling (validation `gtvid/full`, `genvid/full`) and/or eval success
+  rate. (E.g. an early "10× faster" must be confirmed on these, not on the loss.)
+- Always check **`genvid/*`** (generated-video conditioned), not only `gtvid/*`
+  (GT-video) — generated video is what inference actually uses, so this is where the
+  train/inference gap shows up.
+- Standing monitors: `success_rate`, validation action MSE, `source/source_vs_x0_mse`,
+  `source/source_vs_gaussian_mse`, `source/std_mean`, `loss/source_kl`.
+- Honor the **go/no-go gates** — if a phase is unhealthy, go back; don't pile on runs.
