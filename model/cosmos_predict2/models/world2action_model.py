@@ -14,11 +14,16 @@
 # limitations under the License.
 import collections
 import gc
+import json
 import math
+import os
+import pathlib
+import time
 from collections.abc import Mapping
 from typing import Any
 
 import attrs
+import numpy as np
 import torch
 import torch.distributed as dist
 from einops import rearrange
@@ -70,6 +75,18 @@ class World2ActionModelConfig:
     fsdp_shard_size: int  # 0 means not using fsdp, -1 means set to world size
     data_config: DictConfig
 
+    # Optional cache produced by tools/precompute_libero_video_embeddings.py.
+    # When set, training reads frozen video2world hidden states from disk and does
+    # not instantiate or run the video2world backbone online.
+    offline_video_embedding_dir: str = ""
+    offline_video_embedding_required: bool = False
+
+    # Optional cache produced by tools/precompute_libero_video_latents.py.
+    # This stores tokenizer latents, so training still runs the frozen video2world
+    # DiT online but skips zarr RGB loading and tokenizer.encode.
+    offline_video_latent_dir: str = ""
+    offline_video_latent_required: bool = False
+
 
 def _dp_mean(x: torch.Tensor) -> torch.Tensor:
     if dist.is_available() and dist.is_initialized():
@@ -105,6 +122,14 @@ class World2ActionModel(ImaginaireModel):
         assert self.loss_reduce in ["mean", "sum"]
         self.loss_scale = getattr(config, "loss_scale", 1.0)
         log.critical(f"Using {self.loss_reduce} loss reduce with loss scale {self.loss_scale}")
+        self.debug_w2a_timing = os.environ.get("DEBUG_W2A_TIMING", "0").lower() in {"1", "true", "yes", "on"}
+        self.debug_w2a_timing_interval = max(1, int(os.environ.get("DEBUG_W2A_TIMING_INTERVAL", "10")))
+        self.debug_w2a_timing_all_ranks = os.environ.get("DEBUG_W2A_TIMING_ALL_RANKS", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         self.pipe: World2ActionPipeline = World2ActionPipeline.from_config(
             config.pipe_config,
@@ -112,16 +137,37 @@ class World2ActionModel(ImaginaireModel):
             **self.tensor_kwargs,
         )
 
-        self.video2world_pipe: Video2WorldPipeline = Video2WorldPipeline.from_config(
-            config.video_pipe_config,
-            dit_path=config.video_dit_path,
-            use_text_encoder=False,
-        )
-        self.video2world_pipe.requires_grad_(False)
         if config.video_pipe_config.adjust_video_noise:
             self.video_noise_multiplier = math.sqrt(config.video_pipe_config.state_t)
         else:
             self.video_noise_multiplier = 1.0
+
+        self.video2world_pipe: Video2WorldPipeline | None = None
+        self._offline_video_embedding_dir: pathlib.Path | None = None
+        self._offline_crossattn_emb: np.memmap | None = None
+        self._offline_video_sigma: np.memmap | None = None
+        self._offline_video_embedding_meta: dict[str, Any] | None = None
+        self._offline_video_latent_dir: pathlib.Path | None = None
+        self._offline_video_latent: np.memmap | None = None
+        self._offline_video_latent_meta: dict[str, Any] | None = None
+        self._offline_video_latent_num_conditional_frames: int | None = None
+        if config.offline_video_embedding_dir and config.offline_video_latent_dir:
+            raise ValueError("offline_video_embedding_dir and offline_video_latent_dir are mutually exclusive")
+        if config.offline_video_embedding_dir:
+            self._load_offline_video_embeddings(pathlib.Path(config.offline_video_embedding_dir))
+        elif config.offline_video_embedding_required:
+            raise ValueError("offline_video_embedding_required=True but offline_video_embedding_dir is empty")
+        else:
+            self.video2world_pipe = Video2WorldPipeline.from_config(
+                config.video_pipe_config,
+                dit_path=config.video_dit_path,
+                use_text_encoder=False,
+            )
+            self.video2world_pipe.requires_grad_(False)
+            if config.offline_video_latent_dir:
+                self._load_offline_video_latents(pathlib.Path(config.offline_video_latent_dir))
+            elif config.offline_video_latent_required:
+                raise ValueError("offline_video_latent_required=True but offline_video_latent_dir is empty")
 
         self.freeze_parameters()
         if config.train_architecture == "lora":
@@ -178,6 +224,22 @@ class World2ActionModel(ImaginaireModel):
             self.pipe.apply_fsdp(dp_mesh)
         else:
             log.info("FSDP (Fully Sharded Data Parallel) is disabled.")
+
+    def _debug_w2a_timing_rank(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return 0
+
+    def _debug_w2a_timing_should_log(self, iteration: int) -> bool:
+        if not self.debug_w2a_timing:
+            return False
+        if iteration % self.debug_w2a_timing_interval != 0:
+            return False
+        return self.debug_w2a_timing_all_ranks or self._debug_w2a_timing_rank() == 0
+
+    def _debug_w2a_cuda_sync(self) -> None:
+        if self.debug_w2a_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     # New function, added for i4 adaption
     @property
@@ -399,34 +461,222 @@ class World2ActionModel(ImaginaireModel):
 
         return output_batch, loss
 
+    def _load_offline_video_embeddings(self, embedding_dir: pathlib.Path) -> None:
+        meta_path = embedding_dir / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"offline video embedding metadata is missing: {meta_path}")
+        with meta_path.open() as f:
+            meta = json.load(f)
+
+        if int(meta.get("xattn_layer_idx", -1)) != int(self.pipe.config.xattn_layer_idx):
+            raise ValueError(
+                "offline video embedding layer mismatch: "
+                f"cache has {meta.get('xattn_layer_idx')}, model expects {self.pipe.config.xattn_layer_idx}"
+            )
+        if meta.get("crossattn_dtype") != "float16":
+            raise ValueError(f"unsupported offline crossattn dtype: {meta.get('crossattn_dtype')!r}")
+
+        crossattn_path = embedding_dir / meta.get("crossattn_file", "crossattn_emb.fp16.memmap")
+        sigma_path = embedding_dir / meta.get("video_sigma_file", "video_sigma.npy")
+        if not crossattn_path.exists():
+            raise FileNotFoundError(f"offline cross-attention embedding file is missing: {crossattn_path}")
+        if not sigma_path.exists():
+            raise FileNotFoundError(f"offline video sigma file is missing: {sigma_path}")
+
+        crossattn_shape = tuple(int(v) for v in meta["crossattn_shape"])
+        self._offline_crossattn_emb = np.memmap(crossattn_path, dtype=np.float16, mode="r", shape=crossattn_shape)
+        self._offline_video_sigma = np.load(sigma_path, mmap_mode="r")
+        if tuple(self._offline_video_sigma.shape) != (crossattn_shape[0], 1):
+            raise ValueError(
+                f"offline video_sigma shape {self._offline_video_sigma.shape} does not match "
+                f"expected {(crossattn_shape[0], 1)}"
+            )
+
+        self._offline_video_embedding_dir = embedding_dir
+        self._offline_video_embedding_meta = meta
+        log.info(
+            "Using offline video embeddings from "
+            f"{embedding_dir} with shape={crossattn_shape}, dtype=float16"
+        )
+
+    def _get_offline_crossattn_emb(self, data_batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._offline_crossattn_emb is None or self._offline_video_sigma is None:
+            raise RuntimeError("offline video embedding cache is not loaded")
+        if "sample_idx" not in data_batch:
+            raise KeyError(
+                "offline video embeddings require data_batch['sample_idx']; "
+                "regenerate the dataloader after the MimicDataset sample_idx patch"
+            )
+
+        sample_idx = data_batch["sample_idx"]
+        if torch.is_tensor(sample_idx):
+            sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
+        else:
+            sample_idx_np = np.asarray(sample_idx, dtype=np.int64).reshape(-1)
+
+        max_idx = int(sample_idx_np.max(initial=-1))
+        min_idx = int(sample_idx_np.min(initial=0))
+        if min_idx < 0 or max_idx >= self._offline_crossattn_emb.shape[0]:
+            raise IndexError(
+                f"sample_idx range [{min_idx}, {max_idx}] is outside offline cache length "
+                f"{self._offline_crossattn_emb.shape[0]}"
+            )
+
+        crossattn_np = np.asarray(self._offline_crossattn_emb[sample_idx_np], dtype=np.float16)
+        sigma_np = np.asarray(self._offline_video_sigma[sample_idx_np], dtype=np.float32)
+        crossattn_emb = torch.from_numpy(crossattn_np).to(**self.tensor_kwargs)
+        video_sigma_B_1 = torch.from_numpy(sigma_np).to(device=self.tensor_kwargs["device"], dtype=torch.float32)
+        return crossattn_emb, video_sigma_B_1
+
+    def _load_offline_video_latents(self, latent_dir: pathlib.Path) -> None:
+        if self.video2world_pipe is None:
+            raise RuntimeError("offline video latents require the online video2world pipe")
+        meta_path = latent_dir / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"offline video latent metadata is missing: {meta_path}")
+        with meta_path.open() as f:
+            meta = json.load(f)
+
+        if meta.get("latent_dtype") != "float16":
+            raise ValueError(f"unsupported offline video latent dtype: {meta.get('latent_dtype')!r}")
+        latent_shape = tuple(int(v) for v in meta["latent_shape"])
+        expected_tail = (self.video2world_pipe.config.state_ch, self.video2world_pipe.config.state_t, 60, 80)
+        if tuple(latent_shape[1:]) != expected_tail:
+            raise ValueError(
+                f"offline video latent shape {latent_shape} does not match expected (*, {expected_tail})"
+            )
+
+        latent_path = latent_dir / meta.get("latent_file", "video_latent.fp16.memmap")
+        if not latent_path.exists():
+            raise FileNotFoundError(f"offline video latent file is missing: {latent_path}")
+
+        self._offline_video_latent = np.memmap(latent_path, dtype=np.float16, mode="r", shape=latent_shape)
+        self._offline_video_latent_dir = latent_dir
+        self._offline_video_latent_meta = meta
+        self._offline_video_latent_num_conditional_frames = int(meta.get("num_latent_conditional_frames", 2))
+        log.info(
+            "Using offline video tokenizer latents from "
+            f"{latent_dir} with shape={latent_shape}, dtype=float16, "
+            f"num_conditional_frames={self._offline_video_latent_num_conditional_frames}"
+        )
+
+    def _get_sample_idx_np(self, data_batch: dict, *, cache_name: str, cache_len: int) -> np.ndarray:
+        if "sample_idx" not in data_batch:
+            raise KeyError(
+                f"{cache_name} requires data_batch['sample_idx']; "
+                "regenerate the dataloader after the MimicDataset sample_idx patch"
+            )
+        sample_idx = data_batch["sample_idx"]
+        if torch.is_tensor(sample_idx):
+            sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
+        else:
+            sample_idx_np = np.asarray(sample_idx, dtype=np.int64).reshape(-1)
+
+        max_idx = int(sample_idx_np.max(initial=-1))
+        min_idx = int(sample_idx_np.min(initial=0))
+        if min_idx < 0 or max_idx >= cache_len:
+            raise IndexError(f"sample_idx range [{min_idx}, {max_idx}] is outside {cache_name} length {cache_len}")
+        return sample_idx_np
+
+    def _get_offline_video_latent_and_condition(self, data_batch: dict) -> tuple[torch.Tensor, Any]:
+        if self.video2world_pipe is None or self._offline_video_latent is None:
+            raise RuntimeError("offline video latent cache is not loaded")
+        sample_idx_np = self._get_sample_idx_np(
+            data_batch,
+            cache_name="offline video latent cache",
+            cache_len=self._offline_video_latent.shape[0],
+        )
+        latent_np = np.asarray(self._offline_video_latent[sample_idx_np], dtype=np.float16)
+        latent_state = torch.from_numpy(latent_np).to(device=self.tensor_kwargs["device"], dtype=torch.float32)
+
+        B, _C, _T, H, W = latent_state.shape
+        data_batch["padding_mask"] = torch.zeros(B, 1, H, W, **self.video2world_pipe.tensor_kwargs)
+        data_batch["fps"] = torch.full((B, 1), 5, **self.video2world_pipe.tensor_kwargs)
+
+        condition = self.video2world_pipe.conditioner(data_batch)
+        condition = condition.edit_data_type(DataType.VIDEO)
+        condition = condition.set_video_condition(
+            gt_frames=latent_state.to(**self.video2world_pipe.tensor_kwargs),
+            random_min_num_conditional_frames=self.video2world_pipe.config.min_num_conditional_frames,
+            random_max_num_conditional_frames=self.video2world_pipe.config.max_num_conditional_frames,
+            num_conditional_frames=self._offline_video_latent_num_conditional_frames,
+        )
+        return latent_state, condition
+
     def get_crossattn_emb(
         self,
         data_batch: dict,
         video_sigma_B_1: torch.Tensor | None = None,
+        debug_times: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _, video_B_C_T_H_W, condition = self.video2world_pipe.get_mimic_data_and_condition(data_batch)
+        if self._offline_crossattn_emb is not None:
+            if video_sigma_B_1 is not None:
+                raise ValueError("offline video embeddings store a fixed video sigma; explicit video_sigma_B_1 is unsupported")
+            if debug_times is None:
+                return self._get_offline_crossattn_emb(data_batch)
+            self._debug_w2a_cuda_sync()
+            offline_t0 = time.perf_counter()
+            result = self._get_offline_crossattn_emb(data_batch)
+            self._debug_w2a_cuda_sync()
+            debug_times["crossattn/offline_lookup"] = time.perf_counter() - offline_t0
+            return result
 
-        video_epsilon_B_C_T_H_W = torch.randn(video_B_C_T_H_W.size(), **self.tensor_kwargs)
+        if self.video2world_pipe is None:
+            raise RuntimeError("video2world pipe is not loaded and no offline video embedding cache is available")
 
-        if video_sigma_B_1 is None:
-            video_sigma_B_1 = self.draw_video_sigma(video_B_C_T_H_W.size(), condition)
+        with torch.no_grad():
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                mimic_t0 = time.perf_counter()
+            if self._offline_video_latent is not None:
+                video_B_C_T_H_W, condition = self._get_offline_video_latent_and_condition(data_batch)
+                timing_key = "crossattn/latent_lookup_condition"
+            else:
+                _, video_B_C_T_H_W, condition = self.video2world_pipe.get_mimic_data_and_condition(data_batch)
+                timing_key = "crossattn/mimic_tokenizer_condition"
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                debug_times[timing_key] = time.perf_counter() - mimic_t0
 
-        world_pred = self.video2world_pipe.denoise(
-            video_B_C_T_H_W + video_epsilon_B_C_T_H_W * rearrange(video_sigma_B_1, "b t -> b 1 t 1 1"),
-            video_sigma_B_1,
-            condition,
-            use_cuda_graphs=False,
-            return_only_hidden_states_up_to=self.pipe.config.xattn_layer_idx,
-            return_decoded_video=False,
-        )
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                sigma_t0 = time.perf_counter()
+            video_epsilon_B_C_T_H_W = torch.randn(video_B_C_T_H_W.size(), **self.tensor_kwargs)
 
-        crossattn_emb = world_pred.hidden_states[self.pipe.config.xattn_layer_idx]
+            if video_sigma_B_1 is None:
+                video_sigma_B_1 = self.draw_video_sigma(video_B_C_T_H_W.size(), condition)
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                debug_times["crossattn/noise_sigma"] = time.perf_counter() - sigma_t0
 
-        del world_pred
-        gc.collect(0)
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                denoise_t0 = time.perf_counter()
+            world_pred = self.video2world_pipe.denoise(
+                video_B_C_T_H_W + video_epsilon_B_C_T_H_W * rearrange(video_sigma_B_1, "b t -> b 1 t 1 1"),
+                video_sigma_B_1,
+                condition,
+                use_cuda_graphs=False,
+                return_only_hidden_states_up_to=self.pipe.config.xattn_layer_idx,
+                return_decoded_video=False,
+            )
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                debug_times["crossattn/video_dit_to_layer"] = time.perf_counter() - denoise_t0
 
-        B, T, H, W, D = crossattn_emb.shape
-        crossattn_emb = crossattn_emb.reshape(B, T * H * W, D)
+            crossattn_emb = world_pred.hidden_states[self.pipe.config.xattn_layer_idx]
+
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                reshape_t0 = time.perf_counter()
+            del world_pred
+            gc.collect(0)
+
+            B, T, H, W, D = crossattn_emb.shape
+            crossattn_emb = crossattn_emb.reshape(B, T * H * W, D)
+            if debug_times is not None:
+                self._debug_w2a_cuda_sync()
+                debug_times["crossattn/reshape_gc"] = time.perf_counter() - reshape_t0
 
         return crossattn_emb, video_sigma_B_1
 
@@ -437,6 +687,8 @@ class World2ActionModel(ImaginaireModel):
         return self.pipe(state_B_HO_O, crossattn_emb, video_sigma_B_1)
 
     def draw_video_sigma(self, x0_size: torch.Size, condition: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.video2world_pipe is None:
+            raise RuntimeError("draw_video_sigma requires the online video2world pipe")
         batch_size = x0_size[0]
 
         sigma_B = self.video2world_pipe.scheduler.sample_sigma(batch_size)
@@ -458,14 +710,31 @@ class World2ActionModel(ImaginaireModel):
         return sigma_B_1
 
     def training_step(self, data_batch: dict, iteration: int) -> tuple[dict, torch.Tensor]:
+        debug_times: dict[str, float] | None = {} if self._debug_w2a_timing_should_log(iteration) else None
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            total_t0 = time.perf_counter()
+
         data_batch["obs/language_embedding"] = data_batch["obs/language_embedding"].squeeze(1)
         B, _HA, A = data_batch["action/lowdim_concat"].shape
         if "obs/lowdim_concat" not in data_batch:
             data_batch["obs/lowdim_concat"] = torch.empty((B, 0, A), **self.tensor_kwargs)
 
-        crossattn_emb, video_sigma_B_1 = self.get_crossattn_emb(data_batch)
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            crossattn_t0 = time.perf_counter()
+        crossattn_emb, video_sigma_B_1 = self.get_crossattn_emb(data_batch, debug_times=debug_times)
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            debug_times["crossattn/total"] = time.perf_counter() - crossattn_t0
 
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            norm_t0 = time.perf_counter()
         normalised_data_batch: dict = self.pipe.normalizer(data_batch, strict=False)
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            debug_times["normalizer"] = time.perf_counter() - norm_t0
 
         x0_B_HA_A = normalised_data_batch["action/lowdim_concat"]
 
@@ -479,6 +748,9 @@ class World2ActionModel(ImaginaireModel):
 
         # VLSP: draw the flow source first (gaussian == the old epsilon draw),
         # then the timestep -> identical RNG order to the original baseline.
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            source_prior_t0 = time.perf_counter()
         source_B_HA_A, source_metrics = self.pipe.sample_action_source(
             x0_shape=x0_B_HA_A.size(),
             crossattn_emb=crossattn_emb,
@@ -488,12 +760,31 @@ class World2ActionModel(ImaginaireModel):
             language_B_L_D=language_B_L_D,
             training=True,
         )
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            debug_times["source_prior"] = time.perf_counter() - source_prior_t0
+
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            train_t_t0 = time.perf_counter()
         t_B_HA_1 = self.draw_training_t(x0_B_HA_A.size())
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            debug_times["action_t_sample"] = time.perf_counter() - train_t_t0
 
         # VLSP: optionally zero / shuffle / drop the video condition fed to the
         # action DiT (independent of the source prior input above).
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            action_cond_t0 = time.perf_counter()
         crossattn_for_action = self.pipe.prepare_action_condition(crossattn_emb, training=True)
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            debug_times["action_condition"] = time.perf_counter() - action_cond_t0
 
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            action_loss_t0 = time.perf_counter()
         output_batch, loss = self.compute_loss(
             x0_B_HA_A,
             source_B_HA_A,
@@ -503,6 +794,25 @@ class World2ActionModel(ImaginaireModel):
             state_B_HO_O,
             source_metrics,
         )
+        if debug_times is not None:
+            self._debug_w2a_cuda_sync()
+            debug_times["action_loss_forward"] = time.perf_counter() - action_loss_t0
+            debug_times["total_forward_body"] = time.perf_counter() - total_t0
+            print(
+                "[W2A_TIMING]"
+                f"[rank={self._debug_w2a_timing_rank()}]"
+                f"[step={iteration}] "
+                f"crossattn={debug_times.get('crossattn/total', 0.0):.3f}s "
+                f"mimic_tokenizer={debug_times.get('crossattn/mimic_tokenizer_condition', 0.0):.3f}s "
+                f"latent_lookup={debug_times.get('crossattn/latent_lookup_condition', 0.0):.3f}s "
+                f"video_dit={debug_times.get('crossattn/video_dit_to_layer', 0.0):.3f}s "
+                f"offline_lookup={debug_times.get('crossattn/offline_lookup', 0.0):.3f}s "
+                f"source_prior={debug_times.get('source_prior', 0.0):.3f}s "
+                f"action_loss_fwd={debug_times.get('action_loss_forward', 0.0):.3f}s "
+                f"total_body={debug_times.get('total_forward_body', 0.0):.3f}s "
+                f"local_bsz={B}",
+                flush=True,
+            )
 
         return output_batch, loss
 

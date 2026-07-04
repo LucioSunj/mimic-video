@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import time
 
 import torch
@@ -38,6 +40,57 @@ class IterSpeed(EveryN):
         self.hit_thres = hit_thres
         self.name = self.__class__.__name__
         self.last_hit_time = time.time()
+        self.scalar_log_path = None
+
+    @staticmethod
+    def _to_scalar(value):
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().float().cpu().item())
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def _collect_scalars(self, output_batch: dict[str, Tensor], loss: Tensor, iteration: int) -> dict[str, float]:
+        scalars = {"iteration": float(iteration), "loss": float(loss.detach().float().cpu().item())}
+        for key, value in output_batch.items():
+            scalar = self._to_scalar(value)
+            if scalar is not None:
+                scalars[key] = scalar
+
+        x0_mse = scalars.get("source/source_vs_x0_mse")
+        gaussian_mse = scalars.get("source/source_vs_gaussian_mse")
+        if x0_mse is not None and gaussian_mse is not None:
+            scalars["source/source_vs_gaussian_ratio"] = x0_mse / (gaussian_mse + 1e-8)
+        return scalars
+
+    def _write_scalar_log(self, scalars: dict[str, float]) -> None:
+        if self.scalar_log_path is None:
+            self.scalar_log_path = os.path.join(self.config.job.path_local, "train_scalars.jsonl")
+            os.makedirs(os.path.dirname(self.scalar_log_path), exist_ok=True)
+        with open(self.scalar_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(scalars, sort_keys=True) + "\n")
+
+    @staticmethod
+    def _format_scalar_summary(scalars: dict[str, float]) -> str:
+        keys = [
+            "loss/flow",
+            "loss/source_prior",
+            "source/source_vs_x0_mse",
+            "source/source_vs_gaussian_mse",
+            "source/source_vs_gaussian_ratio",
+            "source/std_mean",
+            "source/logstd_mean",
+            "source/mu_std",
+            "Var_inst[x_0]",
+        ]
+        parts = []
+        for key in keys:
+            value = scalars.get(key)
+            if value is not None:
+                parts.append(f"{key}={value:.6g}")
+        return " | ".join(parts)
 
     def on_training_step_end(
         self,
@@ -77,6 +130,10 @@ class IterSpeed(EveryN):
         cur_time = time.time()
         iter_speed = (cur_time - self.time) / self.every_n / self.step_size
 
-        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}")
+        scalars = self._collect_scalars(output_batch, loss, iteration)
+        self._write_scalar_log(scalars)
+        scalar_summary = self._format_scalar_summary(scalars)
+        suffix = f" | {scalar_summary}" if scalar_summary else ""
+        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}{suffix}")
 
         self.time = cur_time

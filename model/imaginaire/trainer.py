@@ -19,6 +19,7 @@ import inspect
 import itertools as it
 import os
 import signal
+import time
 
 import torch
 import torch.distributed as dist
@@ -136,11 +137,48 @@ class ImaginaireTrainer:
             )
         # Initialize the timer for speed benchmarking.
         self.training_timer = misc.TrainingTimer()
+        self.debug_step_timing = os.environ.get("DEBUG_STEP_TIMING", "0").lower() in {"1", "true", "yes", "on"}
+        self.debug_step_timing_interval = max(1, int(os.environ.get("DEBUG_STEP_TIMING_INTERVAL", "10")))
+        self.debug_step_timing_all_ranks = os.environ.get("DEBUG_STEP_TIMING_ALL_RANKS", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._debug_step_timing_current: dict[str, float] | None = None
         # Send a TimeoutError if a training step takes over timeout_period seconds.
         signal.signal(
             signal.SIGALRM,
             functools.partial(misc.timeout_handler, config.trainer.timeout_period),
         )
+
+    def _debug_timing_rank(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return 0
+
+    def _debug_timing_world_size(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_world_size()
+        return 1
+
+    def _debug_timing_should_log(self, iteration: int) -> bool:
+        if not self.debug_step_timing:
+            return False
+        if iteration % self.debug_step_timing_interval != 0:
+            return False
+        return self.debug_step_timing_all_ranks or self._debug_timing_rank() == 0
+
+    def _debug_timing_cuda_sync(self) -> None:
+        if self.debug_step_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    @staticmethod
+    def _debug_infer_local_batch_size(data_batch: dict[str, torch.Tensor], fallback: int | None = None) -> int | None:
+        for value in data_batch.values():
+            if torch.is_tensor(value) and value.ndim > 0:
+                return int(value.shape[0])
+        return fallback
 
     def train(
         self,
@@ -207,6 +245,9 @@ class ImaginaireTrainer:
                 dataloader_train_iter = iter(dataloader_train)
                 while True:
                     self.callbacks.on_before_dataloading(iteration)
+                    debug_timing_active = self.debug_step_timing
+                    debug_total_t0 = time.perf_counter() if debug_timing_active else None
+                    debug_data_t0 = time.perf_counter() if debug_timing_active else None
                     try:
                         with self.training_timer("dataloader_train"):
                             data_batch = next(dataloader_train_iter)
@@ -214,12 +255,22 @@ class ImaginaireTrainer:
                         break
                     finally:
                         self.callbacks.on_after_dataloading(iteration)
+                    debug_times: dict[str, float] = {}
+                    if debug_timing_active and debug_data_t0 is not None:
+                        debug_times["data_time"] = time.perf_counter() - debug_data_t0
                     # If max_iter is reached, exit the training loop.
                     if iteration >= self.config.trainer.max_iter:
                         _end_training = True
                         break
                     # Move all tensors in the data batch to GPU device.
+                    if debug_timing_active:
+                        self._debug_timing_cuda_sync()
+                        debug_h2d_t0 = time.perf_counter()
                     data_batch = misc.to(data_batch, device="cuda")
+                    if debug_timing_active:
+                        self._debug_timing_cuda_sync()
+                        debug_times["h2d_time"] = time.perf_counter() - debug_h2d_t0
+                        self._debug_step_timing_current = debug_times
                     # The actual training step.
                     self.callbacks.on_training_step_start(model, data_batch, iteration=iteration)
                     self.callbacks.on_training_step_batch_start(model, data_batch, iteration=iteration)
@@ -236,6 +287,27 @@ class ImaginaireTrainer:
                         iteration=iteration,
                         grad_accum_iter=grad_accum_iter,
                     )
+                    if debug_timing_active and debug_total_t0 is not None:
+                        self._debug_timing_cuda_sync()
+                        debug_times["total_step_time"] = time.perf_counter() - debug_total_t0
+                        if grad_accum_iter == 0 and self._debug_timing_should_log(iteration):
+                            local_bsz = self._debug_infer_local_batch_size(data_batch, dataloader_train.batch_size)
+                            world_size = self._debug_timing_world_size()
+                            global_bsz = None if local_bsz is None else local_bsz * world_size
+                            log.info(
+                                "[TIMING]"
+                                f"[rank={self._debug_timing_rank()}]"
+                                f"[step={iteration}] "
+                                f"data={debug_times.get('data_time', 0.0):.3f}s "
+                                f"h2d={debug_times.get('h2d_time', 0.0):.3f}s "
+                                f"fwd={debug_times.get('forward_time', 0.0):.3f}s "
+                                f"bwd={debug_times.get('backward_time', 0.0):.3f}s "
+                                f"opt={debug_times.get('optimizer_step_time', 0.0):.3f}s "
+                                f"zero_grad={debug_times.get('zero_grad_time', 0.0):.3f}s "
+                                f"total={debug_times.get('total_step_time', 0.0):.3f}s "
+                                f"local_bsz={local_bsz} global_bsz={global_bsz}"
+                            )
+                        self._debug_step_timing_current = None
                     self.callbacks.on_training_step_batch_end(
                         model, data_batch, output_batch, loss, iteration=iteration
                     )
@@ -320,12 +392,22 @@ class ImaginaireTrainer:
             loss (torch.Tensor): The total loss of the training data batch.
         """
         # Only let DDP sync gradient at the last iteration of the gradient accumulation window
+        debug_times = self._debug_step_timing_current
         with distributed.ddp_sync_grad(model_ddp, grad_accum_iter == self.config.trainer.grad_accum_iter - 1):
             self.callbacks.on_before_forward(iteration=iteration)
+            if debug_times is not None:
+                self._debug_timing_cuda_sync()
+                debug_forward_t0 = time.perf_counter()
             with self.training_timer("forward"):
                 output_batch, loss = model_ddp.training_step(data, iteration)
+            if debug_times is not None:
+                self._debug_timing_cuda_sync()
+                debug_times["forward_time"] = time.perf_counter() - debug_forward_t0
             self.callbacks.on_after_forward(iteration=iteration)
             self.callbacks.on_before_backward(model_ddp, loss, iteration=iteration)
+            if debug_times is not None:
+                self._debug_timing_cuda_sync()
+                debug_backward_t0 = time.perf_counter()
             with self.training_timer("backward"):
                 loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
                 loss_scaled.backward()
@@ -333,22 +415,35 @@ class ImaginaireTrainer:
                     model_ddp.module.on_after_backward()
                 else:
                     model_ddp.on_after_backward()
+            if debug_times is not None:
+                self._debug_timing_cuda_sync()
+                debug_times["backward_time"] = time.perf_counter() - debug_backward_t0
             self.callbacks.on_after_backward(model_ddp, iteration=iteration)
         grad_accum_iter += 1
         if grad_accum_iter == self.config.trainer.grad_accum_iter:
             with self.training_timer("optimizer_step"):
+                if debug_times is not None:
+                    self._debug_timing_cuda_sync()
+                    debug_optimizer_t0 = time.perf_counter()
                 self.callbacks.on_before_optimizer_step(
                     model_ddp, optimizer, scheduler, grad_scaler, iteration=iteration
                 )
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
                 scheduler.step()
+                if debug_times is not None:
+                    self._debug_timing_cuda_sync()
+                    debug_times["optimizer_step_time"] = time.perf_counter() - debug_optimizer_t0
+                    debug_zero_t0 = time.perf_counter()
                 self.callbacks.on_before_zero_grad(model_ddp, optimizer, scheduler, iteration=iteration)
                 if self.config.trainer.distributed_parallelism == "ddp":
                     model_ddp.module.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
                 else:
                     model_ddp.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
                 optimizer.zero_grad(set_to_none=True)
+                if debug_times is not None:
+                    self._debug_timing_cuda_sync()
+                    debug_times["zero_grad_time"] = time.perf_counter() - debug_zero_t0
             grad_accum_iter = 0
         return output_batch, loss, grad_accum_iter
 

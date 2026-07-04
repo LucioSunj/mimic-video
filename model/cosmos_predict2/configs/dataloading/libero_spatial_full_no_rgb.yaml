@@ -1,6 +1,6 @@
 defaults:
   - dataset: libero
-  - policy_io: libero
+  - policy_io: libero_no_rgb
   - _self_
 
 dataset:

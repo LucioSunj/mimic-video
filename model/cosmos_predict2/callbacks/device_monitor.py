@@ -109,18 +109,35 @@ class DeviceMonitor(EveryN):
 
         peak_gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
         peak_gpu_mem_reserved_gb = torch.cuda.max_memory_reserved() / (1024**3)
-        temp = torch.cuda.temperature()
+        try:
+            temp = torch.cuda.temperature()
+        except Exception as e:
+            log.warning(f"Failed to get CUDA temperature with error {e}")
+            temp = 0
         try:
             power = torch.cuda.power_draw()
         except Exception as e:
             log.warning(f"Failed to get power draw with error {e}")
             power = 0
-        util = torch.cuda.utilization()
-        clock = torch.cuda.clock_rate()
+        try:
+            util = torch.cuda.utilization()
+        except Exception as e:
+            log.warning(f"Failed to get CUDA utilization with error {e}")
+            util = 0
+        try:
+            clock = torch.cuda.clock_rate()
+        except Exception as e:
+            log.warning(f"Failed to get CUDA clock rate with error {e}")
+            clock = 0
 
-        memory_info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
-        nvml_used_gpu_mem_gb = memory_info.used / (1024**3)
-        nvml_free_gpu_mem_gb = memory_info.free / (1024**3)
+        try:
+            memory_info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+            nvml_used_gpu_mem_gb = memory_info.used / (1024**3)
+            nvml_free_gpu_mem_gb = memory_info.free / (1024**3)
+        except Exception as e:
+            log.warning(f"Failed to get NVML memory info with error {e}")
+            nvml_used_gpu_mem_gb = 0
+            nvml_free_gpu_mem_gb = 0
 
         prof_data = {
             "cpu_mem_gb": cpu_mem_gb,

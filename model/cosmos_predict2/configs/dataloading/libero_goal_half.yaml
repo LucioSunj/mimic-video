@@ -5,4 +5,4 @@ defaults:
 
 dataset:
   dataset:
-    data_dir: /path/to/libero_goal_half
+    data_dir: /XYFS02/HDD_POOL/nju_shklu/nju_shklu_1/Video-as-action-generation-source/mimic-video/data/libero_goal_half

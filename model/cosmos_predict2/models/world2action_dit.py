@@ -790,6 +790,7 @@ class World2ActionDIT(nn.Module):
         self.num_heads = num_heads
         self.num_blocks = num_blocks
         self.model_channels = model_channels
+        self.crossattn_emb_channels = crossattn_emb_channels
         self.atten_backend = atten_backend
         self.cuda_graphs = {}
 

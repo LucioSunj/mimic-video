@@ -58,6 +58,11 @@ def init() -> int | None:
     # Set GPU affinity.
     pynvml.nvmlInit()
     local_rank = int(os.getenv("LOCAL_RANK", 0))
+    cuda_local_rank = local_rank
+    if torch.cuda.is_available():
+        cuda_device_count = torch.cuda.device_count()
+        if cuda_device_count > 0 and cuda_local_rank >= cuda_device_count:
+            cuda_local_rank = 0
     try:
         device = Device(local_rank)
         os.sched_setaffinity(0, device.get_cpu_affinity())
@@ -67,16 +72,22 @@ def init() -> int | None:
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     if dist.is_available():
-        torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(cuda_local_rank)
         # Get the timeout value from environment variable
         timeout_seconds = os.getenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", 1800)
         # Convert the timeout to an integer (if it isn't already) and then to a timedelta
         timeout_timedelta = timedelta(seconds=int(timeout_seconds))
-        dist.init_process_group(
-            backend="nccl", init_method="env://", timeout=timeout_timedelta
-        )
+        backend = os.getenv("MIMIC_DISTRIBUTED_BACKEND", "nccl")
+        init_kwargs = dict(backend=backend, init_method="env://", timeout=timeout_timedelta)
+        if backend == "nccl":
+            try:
+                dist.init_process_group(**init_kwargs, device_id=torch.device(f"cuda:{cuda_local_rank}"))
+            except TypeError:
+                dist.init_process_group(**init_kwargs)
+        else:
+            dist.init_process_group(**init_kwargs)
         log.info(
-            f"Initialized distributed training with local rank {local_rank} with timeout {timeout_seconds}",
+            f"Initialized distributed training with local rank {local_rank}, cuda device {cuda_local_rank} with timeout {timeout_seconds}",
             rank0_only=False,
         )
     # Increase the L2 fetch granularity for faster speed.
@@ -207,6 +218,11 @@ def parallel_model_wrapper(
     """
     if dist.is_available() and dist.is_initialized():
         local_rank = int(os.getenv("LOCAL_RANK", 0))
+        cuda_local_rank = local_rank
+        if torch.cuda.is_available():
+            cuda_device_count = torch.cuda.device_count()
+            if cuda_device_count > 0 and cuda_local_rank >= cuda_device_count:
+                cuda_local_rank = 0
         try:
             ddp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=with_cp
@@ -220,8 +236,8 @@ def parallel_model_wrapper(
 
         model = DistributedDataParallel(
             model,
-            device_ids=[local_rank],
-            output_device=local_rank,
+            device_ids=[cuda_local_rank],
+            output_device=cuda_local_rank,
             find_unused_parameters=config_ddp.find_unused_parameters,
             static_graph=config_ddp.static_graph,
             broadcast_buffers=config_ddp.broadcast_buffers,

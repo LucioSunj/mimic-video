@@ -166,6 +166,8 @@ class MimicDataset(torch.utils.data.Dataset):
             self._threadpool_limits_is_applied = True
 
         data = self._chunk_reader.read_chunk(idx)
+        if not self._should_ignore_transforms_for_norm:
+            data["sample_idx"] = np.array(idx, dtype=np.int64)
 
         return apply_data_transforms(
             data,
