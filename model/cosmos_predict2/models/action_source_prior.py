@@ -518,7 +518,17 @@ class ActionSourcePrior(nn.Module):
         with torch.no_grad():
             metrics["source/mu_mean"] = mu.mean()
             metrics["source/mu_std"] = mu.std()
+            # Run-1 lesson: mu.std() is a GLOBAL std over [B, HA, A] and cannot
+            # distinguish "mu varies with the video" from "one fixed trajectory
+            # for every video".  mu_batch_std is the std ACROSS THE BATCH per
+            # (step, dim), averaged — ~0 means the prior ignores its input.
+            metrics["source/mu_batch_std"] = mu.float().std(dim=0, unbiased=False).mean()
             metrics["source/logstd_mean"] = logstd.mean()
+            # Fraction of logstd pinned at the clamp floor — variance-collapse
+            # alarm (run 1 sat at 1.0 with logstd_min=-5 for the entire run).
+            metrics["source/logstd_floor_frac"] = (
+                (logstd <= float(self.cfg.logstd_min) + 0.05).float().mean()
+            )
             metrics["source/std_mean"] = std.mean()
         return self._finalize(source, shape, x0_B_HA_A, metrics, mode, randn)
 
@@ -546,7 +556,9 @@ class ActionSourcePrior(nn.Module):
             device = source.device
             metrics.setdefault("source/mu_mean", torch.zeros((), device=device))
             metrics.setdefault("source/mu_std", torch.zeros((), device=device))
+            metrics.setdefault("source/mu_batch_std", torch.zeros((), device=device))
             metrics.setdefault("source/logstd_mean", torch.zeros((), device=device))
+            metrics.setdefault("source/logstd_floor_frac", torch.zeros((), device=device))
             metrics.setdefault("source/std_mean", torch.ones((), device=device))
             metrics.setdefault("source/shuffle_enabled", torch.zeros((), device=device))
             metrics.setdefault("source/dropout_rate_actual", torch.zeros((), device=device))

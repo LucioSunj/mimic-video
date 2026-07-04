@@ -88,6 +88,15 @@ class World2ActionModelConfig:
     offline_video_latent_dir: str = ""
     offline_video_latent_required: bool = False
 
+    # Every N iterations, run the full sampling loop on the current train batch
+    # (GT-video conditioning) and log the unnormalized action MSE as
+    # `probe/sampled_action_mse_gtvid`. 0 disables. Run-1 lesson: LIBERO configs
+    # have run_validation=False, so without this probe there is NO
+    # scale-invariant, source-independent metric during training and a collapsed
+    # source prior stays invisible until sim eval (the flow loss is NOT
+    # comparable across source modes).
+    sampled_mse_probe_interval: int = 0
+
 
 def _dp_mean(x: torch.Tensor) -> torch.Tensor:
     if dist.is_available() and dist.is_initialized():
@@ -849,6 +858,44 @@ class World2ActionModel(ImaginaireModel):
                 f"local_bsz={B}",
                 flush=True,
             )
+
+        # VLSP collapse alarm (run-1 failure mode): logstd sinking toward the
+        # clamp floor means the source is degenerating into a Dirac. Warn early
+        # (-2.5 is far above the floor of logstd_min=-5), throttled by iteration.
+        if "logstd" in source_metrics and iteration % 1_000 == 0:
+            logstd_mean = float(source_metrics["logstd"].detach().mean().item())
+            if logstd_mean < -2.5:
+                log.warning(
+                    f"[VLSP] source prior variance collapsing: logstd_mean={logstd_mean:.3f} "
+                    f"(floor={self.pipe.config.action_source_prior.logstd_min}). "
+                    "Consider kl_weight>=1e-3, video_prior_blend, or a higher logstd_min."
+                )
+
+        # Scale-invariant training probe: full sampling on the current batch
+        # (GT-video conditioning) -> unnormalized action MSE. Unlike the flow
+        # loss this IS comparable across source modes and to the baseline.
+        # Runs on ALL ranks at the same iterations, so the _dp_mean collective
+        # inside is safe under DDP/FSDP.
+        probe_interval = getattr(self.config, "sampled_mse_probe_interval", 0)
+        if probe_interval and probe_interval > 0 and iteration > 0 and iteration % probe_interval == 0:
+            with torch.no_grad():
+                pred_B_HA_A = self.pipe(
+                    state_B_HO_O=data_batch["obs/lowdim_concat"],
+                    crossattn_emb=crossattn_emb,
+                    context_timesteps_B_1=video_sigma_B_1,
+                    seed=0,
+                    use_cuda_graphs=False,
+                )
+                probe_mse = F.mse_loss(
+                    pred_B_HA_A.float(), data_batch["action/lowdim_concat"].float()
+                )
+                probe_mse = _dp_mean(probe_mse.detach().clone())
+                if (
+                    not dist.is_available()
+                    or not dist.is_initialized()
+                    or parallel_state.get_data_parallel_rank() == 0
+                ):
+                    output_batch["probe/sampled_action_mse_gtvid"] = probe_mse.item()
 
         return output_batch, loss
 

@@ -135,8 +135,19 @@ for video_ckpt, data_config, xattn_layer_idx, lr, bsz in it.product(
 #  `model.config.pipe_config.action_conditioning.*` overrides on the CLI       #
 #  (see VLSP.md).                                                              #
 # --------------------------------------------------------------------------- #
-def _vlsp_variant(*, mode: str, conditioning: str = "normal", enabled: bool | None = None, **prior_kwargs) -> dict:
-    """Build the pipe_config overrides for one VLSP variant."""
+def _vlsp_variant(
+    *,
+    mode: str,
+    conditioning: str = "normal",
+    enabled: bool | None = None,
+    model_config: dict | None = None,
+    **prior_kwargs,
+) -> dict:
+    """Build the pipe_config overrides for one VLSP variant.
+
+    ``model_config`` entries are merged into ``model.config`` (e.g. the
+    ``sampled_mse_probe_interval`` training probe).
+    """
     if enabled is None:
         # gaussian is the only mode that is meaningful with VLSP disabled.
         enabled = mode != "gaussian"
@@ -145,6 +156,7 @@ def _vlsp_variant(*, mode: str, conditioning: str = "normal", enabled: bool | No
     return {
         "action_source_prior": action_source_prior,
         "action_conditioning": {"mode": conditioning},
+        "model_config": model_config or {},
     }
 
 
@@ -171,6 +183,38 @@ VLSP_VARIANTS: dict[str, dict] = {
     "vlsp_residual": _vlsp_variant(mode="video_prior_residual", residual_scale=1.0),
     # debug-only smoke mode
     "vlsp_debug_gt_action_noisy": _vlsp_variant(mode="gt_action_noisy_debug", debug_noise_std=0.05),
+    # ------------------------------------------------------------------ #
+    # Run-2 anti-collapse variants (see VLSP_RUN1_ANALYSIS.md). Run 1
+    # (kl=0, video_prior_sample) collapsed to a Dirac source
+    # (logstd pinned at the -5 floor) => fixed task-independent actions.
+    # All three keep conditioning=normal and enable the sampled-MSE probe.
+    # ------------------------------------------------------------------ #
+    # R1: primary fix — KL keeps sigma near 1 (source stays a "hint").
+    "vlsp_r1_kl_1e3": _vlsp_variant(
+        mode="video_prior_sample",
+        conditioning="normal",
+        kl_weight=1e-3,
+        model_config={"sampled_mse_probe_interval": 500},
+    ),
+    # R2: structural fallback — blend guarantees a sqrt(1-a^2)=0.87-std
+    #     Gaussian component that no optimizer pressure can remove; its
+    #     worst-case degeneration is the baseline, not a broken model.
+    "vlsp_r2_blend_050": _vlsp_variant(
+        mode="video_prior_blend",
+        conditioning="normal",
+        blend_alpha=0.5,
+        kl_weight=1e-3,
+        model_config={"sampled_mse_probe_interval": 500},
+    ),
+    # R3: R1 + per-sample source dropout — the DiT keeps a noise-robust
+    #     mode by seeing pure-Gaussian sources 20% of the time.
+    "vlsp_r3_kl_dropout_020": _vlsp_variant(
+        mode="video_prior_dropout",
+        conditioning="normal",
+        kl_weight=1e-3,
+        source_dropout_prob=0.20,
+        model_config={"sampled_mse_probe_interval": 500},
+    ),
 }
 
 if vlsp_base_cfg is not None:
@@ -180,6 +224,8 @@ if vlsp_base_cfg is not None:
         vlsp_cfg["job"]["name"] = vlsp_name
         vlsp_cfg["model"]["config"]["pipe_config"]["action_source_prior"] = overrides["action_source_prior"]
         vlsp_cfg["model"]["config"]["pipe_config"]["action_conditioning"] = overrides["action_conditioning"]
+        for extra_key, extra_val in overrides.get("model_config", {}).items():
+            vlsp_cfg["model"]["config"][extra_key] = copy.deepcopy(extra_val)
         cs.store(
             group="experiment",
             package="_global_",

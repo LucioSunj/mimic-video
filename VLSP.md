@@ -480,5 +480,19 @@ a bonus.
   (GT-video) — generated video is what inference actually uses, so this is where the
   train/inference gap shows up.
 - Standing monitors: `success_rate`, validation action MSE, `source/source_vs_x0_mse`,
-  `source/source_vs_gaussian_mse`, `source/std_mean`, `loss/source_kl`.
+  `source/source_vs_gaussian_mse`, `source/std_mean`, `source/mu_batch_std`,
+  `source/logstd_floor_frac`, `probe/sampled_action_mse_gtvid`, `loss/source_kl`.
 - Honor the **go/no-go gates** — if a phase is unhealthy, go back; don't pile on runs.
+
+## 12. Run log
+
+- **Run 1 (2026-07, LIBERO-goal, B & C with kl=0) — FAILED: fixed
+  task-independent actions.** Root cause: source-prior **variance collapse**
+  (logstd pinned at the −5 floor ⇒ Dirac source) with a suspected
+  input-independent mu; the early "10× faster loss" was this collapse, not
+  learning. Full evidence, three pre-retraining diagnostics
+  (`scripts/vlsp_probe_prior.py`), the Run-2 plan (R1 `vlsp_r1_kl_1e3` /
+  R2 `vlsp_r2_blend_050` / R3 `vlsp_r3_kl_dropout_020`), in-training gates and
+  the new collapse metrics are documented in
+  **[VLSP_RUN1_ANALYSIS.md](VLSP_RUN1_ANALYSIS.md)** — read it before launching
+  any new VLSP run.
