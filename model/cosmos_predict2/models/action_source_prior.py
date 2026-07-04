@@ -278,11 +278,21 @@ class VideoLatentSourcePrior(nn.Module):
             else:
                 h = h + 0.0 * self.time_proj(h.new_zeros((B, self.time_proj.in_features)))
 
-        if self.use_language and language_B_L_D is not None:
-            lang = language_B_L_D
-            if lang.dim() == 3:
-                lang = lang.mean(dim=1)
-            h = h + self.lang_proj(lang.to(h.dtype))
+        if self.use_language:
+            if language_B_L_D is not None:
+                lang = language_B_L_D
+                if lang.dim() == 3:
+                    lang = lang.mean(dim=1)
+                h = h + self.lang_proj(lang.to(h.dtype))
+            elif getattr(self.lang_proj, "has_uninitialized_params", lambda: False)():
+                raise ValueError(
+                    "action_source_prior.use_language=true requires language_B_L_D on the first "
+                    "prior forward so lang_proj can infer the language embedding width."
+                )
+            else:
+                # Keep lang_proj in the autograd graph when a later batch has no
+                # language tensor, so DDP with find_unused_parameters=False is safe.
+                h = h + 0.0 * self.lang_proj(h.new_zeros((B, self.lang_proj.in_features)))
 
         per_step = self.horizon_queries[:, :horizon, :].to(h.dtype) + h.unsqueeze(1)  # [B, HA, hidden]
         per_step = self.trunk(per_step)
@@ -317,6 +327,13 @@ class ActionSourcePrior(nn.Module):
         self.cfg = cfg
         self.action_dim = action_dim
         self.max_horizon = max_horizon
+        if cfg.mode not in ALL_SOURCE_MODES:
+            raise ValueError(f"unknown source_mode: {cfg.mode!r}")
+        if bool(cfg.enabled) and cfg.mode == "gaussian":
+            raise ValueError(
+                "action_source_prior.enabled=true with mode='gaussian' is ambiguous: "
+                "use enabled=false for the exact Gaussian baseline, or choose a video-prior mode."
+            )
 
         self._uses_net = bool(cfg.enabled) and cfg.mode in VIDEO_PRIOR_MODES
         if self._uses_net:

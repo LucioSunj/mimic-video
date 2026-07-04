@@ -33,6 +33,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
+from torch.nn.parameter import is_lazy
 from torch.nn.modules.module import _IncompatibleKeys
 
 from cosmos_predict2.conditioner import DataType
@@ -296,16 +297,51 @@ class World2ActionModel(ImaginaireModel):
             if self.pipe.source_prior_ema is not None:
                 self._update_source_prior_ema(ema_beta)
 
+    def on_after_backward(self, iteration: int = 0) -> None:
+        del iteration
+        if self.config.fsdp_shard_size != 0 and self.pipe.source_prior_has_params:
+            self._sync_source_prior_grads()
+
+    @torch.no_grad()
+    def _sync_source_prior_grads(self) -> None:
+        """Average replicated source-prior grads for FSDP-only runs."""
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        group = getattr(self.pipe, "source_prior_dp_group", None)
+        if group is not None:
+            world = len(dist.get_process_group_ranks(group))
+        else:
+            try:
+                group = parallel_state.get_data_parallel_group()
+                world = parallel_state.get_data_parallel_world_size()
+            except Exception:
+                group = None
+                world = dist.get_world_size()
+
+        if world <= 1:
+            return
+
+        for param in self.pipe.source_prior.parameters():
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)
+            param.grad.div_(world)
+
     @torch.no_grad()
     def _update_source_prior_ema(self, beta: float) -> None:
         """Param-wise EMA for the VLSP source prior (weights = beta*ema + (1-beta)*new).
 
-        Implemented for the standard DDP / non-FSDP path. FSDP+EMA for the source
-        prior is not specially handled (the prior is small and left replicated);
-        see VLSP.md for the limitation.
+        Lazy language projection weights are materialized into the EMA copy on the
+        first update after the trainable source prior sees language inputs.
         """
+        if any(is_lazy(p) for p in self.pipe.source_prior_ema.parameters()):
+            self.pipe.source_prior_ema.load_state_dict(self.pipe.source_prior.state_dict(), strict=False)
+
         src_params = dict(self.pipe.source_prior.named_parameters())
         for name, p_ema in self.pipe.source_prior_ema.named_parameters():
+            if is_lazy(p_ema) or is_lazy(src_params[name]):
+                continue
             p_ema.mul_(beta).add_(src_params[name].detach(), alpha=1.0 - beta)
         src_buffers = dict(self.pipe.source_prior.named_buffers())
         for name, b_ema in self.pipe.source_prior_ema.named_buffers():

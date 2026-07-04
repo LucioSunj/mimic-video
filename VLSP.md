@@ -68,6 +68,11 @@ prediction is unnormalized by the existing action unnormalizer.
 | `shuffled_video_prior`  | like `video_prior_sample` with video latents batch-shuffled  | yes            | given seed    |
 | `gt_action_noisy_debug` | `x0 + debug_noise_std * randn` (training/debug only)         | no             | no            |
 
+The exact Gaussian baseline is `enabled=false, mode=gaussian`. The code rejects
+`enabled=true, mode=gaussian` because it is easy to mistake that setting for the
+bit-identical baseline while still enabling VLSP-side metrics / conditioning
+logic.
+
 `action_conditioning.mode` (independent of the source):
 
 | mode             | video latent fed to the action DiT                  |
@@ -159,6 +164,12 @@ available). Sweeps over `blend_alpha`, `residual_scale`, `source_dropout_prob`
 and `sampling_temperature` can be done by overriding the corresponding field on
 the CLI (below).
 
+`source + dropout condition` is supported by the current config surface but is
+not registered as a named experiment yet: use a video-prior source mode and set
+`action_conditioning.mode=dropout_video`. This is different from
+`vlsp_dropout_020`, which drops the **source** back to Gaussian while keeping the
+action DiT condition normal.
+
 Full ablation table the code supports without further edits:
 
 ```
@@ -173,6 +184,7 @@ H. Blend                   source=video_prior_blend      blend_alpha in {0.25,0.
 I. Residual                source=video_prior_residual   residual_scale in {0.25,0.5,1.0,2.0}
 J. Dropout                 source=video_prior_dropout    source_dropout_prob in {0.1,0.2,0.5}
 K. Temperature             source=video_prior_sample     sampling_temperature in {0.0,0.5,1.0,1.5}
+L. Source + dropout cond   source=video_prior_sample     cond=dropout_video, dropout_prob in {.1,.2,.5}
 ```
 
 ## 6. Example commands
@@ -202,6 +214,16 @@ torchrun --nproc_per_node=4 -m scripts.train \
 torchrun --nproc_per_node=4 -m scripts.train \
   --config=cosmos_predict2/configs/config.py -- \
   experiment=vlsp_source_condition_sample
+```
+
+**VLSP source + dropout condition (ad-hoc; not a registered experiment name):**
+
+```bash
+torchrun --nproc_per_node=4 -m scripts.train \
+  --config=cosmos_predict2/configs/config.py -- \
+  experiment=vlsp_source_condition_sample \
+  model.config.pipe_config.action_conditioning.mode=dropout_video \
+  model.config.pipe_config.action_conditioning.dropout_prob=0.2
 ```
 
 **Shuffled-source negative control:**
@@ -295,15 +317,14 @@ condition/mode_id, condition/shuffle_enabled
   heads (`mu`, `logstd`) are always kept in the autograd graph for every mode
   (the unused term is numerically zero), so deterministic modes (`mean`,
   `residual`) and all-dropout batches do not trip DDP.
-- **EMA:** a simple param-wise EMA of the source prior is maintained for the
-  standard non-FSDP path (`source_prior_ema`), updated with the DiT EMA beta.
-- **FSDP limitation:** the source prior is left **replicated** (not sharded); it
-  is small. Under an FSDP-only run (no DDP wrapper), gradients for replicated
-  parameters are not automatically all-reduced across data-parallel ranks, and
-  FSDP+EMA for the source prior is not specially handled. The default trainer
-  (`distributed_parallelism="ddp"`, `fsdp_shard_size=0`) is unaffected. If you
-  enable FSDP, add explicit gradient synchronization for the source prior or
-  wrap it in its own FSDP unit.
+- **EMA:** a simple param-wise EMA of the source prior is maintained
+  (`source_prior_ema`), updated with the DiT EMA beta. Validation / inference
+  under `ema_scope()` switches both the DiT and the source prior to their EMA
+  weights, then restores both.
+- **FSDP:** the source prior is left **replicated** (not sharded), because it is
+  small. FSDP initialization broadcasts the replicated source-prior weights, and
+  `World2ActionModel.on_after_backward()` explicitly averages its gradients
+  across the replicate group before the optimizer step.
 
 ## 10. Related work & design rationale
 
@@ -356,7 +377,16 @@ Reading their code directly shaped several VLSP design decisions.
 2. **VITA-style recipe in VLSP.** `source_mode=video_prior_mean` +
    `action_conditioning=zero_video` reproduces VITA's *source-only,
    conditioning-free* setup (experiment row D), here in raw action space.
-3. **Source collapse.** Because our source is trainable and `x0` is the fixed GT
+3. **Source-only is a strict bottleneck, not necessarily the strongest final
+   model.** In rows B/D the video latent tokens can reach the action decoder only
+   after being compressed into `source: [B, HA, action_dim]`; the action DiT sees
+   `zero_video` instead of the full `[B, N, D]` video token set. This cleanly tests
+   whether "video as source" carries useful signal by itself, but it can lose
+   spatial/object/future-state detail. Row C/E (`source + condition`) is the main
+   performance candidate; row L (`source + dropout condition`) is the softer
+   middle ground if we want to encourage reliance on the source without fully
+   cutting the condition path.
+4. **Source collapse.** Because our source is trainable and `x0` is the fixed GT
    action, the flow loss admits a degenerate optimum `source → x0 ⇒ u_t → 0` that
    bypasses the DiT. A2A/VITA prevent this with reconstruction / contrastive /
    consistency anchoring (and VITA deliberately *aligns* source≈target while
@@ -364,7 +394,7 @@ Reading their code directly shaped several VLSP design decisions.
    (default 0). **Recommendation**: for `video_prior_*` modes set a small
    `kl_weight` (e.g. `1e-3`) and watch `source/source_vs_x0_mse`; an optional
    VITA-style consistency anchor is a natural extension.
-4. **Endpoint convention.** A2A/VITA (torchcfm) put the source at `t=0` and data
+5. **Endpoint convention.** A2A/VITA (torchcfm) put the source at `t=0` and data
    at `t=1`; mimic-video puts data at `t=0` and the source at `t=1` (the sampler
    integrates `t: 1→0`). VLSP places the learned source at mimic-video's `t=1`
    endpoint — exactly where `torch.randn_like(action)` used to be — so the
@@ -378,8 +408,8 @@ Reading their code directly shaped several VLSP design decisions.
 ## 11. Experiment protocol & order (go/no-go)
 
 Run experiments **cheapest-to-validate / most-decisive first**, with a go/no-go
-gate between phases. The letters (A–K) refer to the matrix in §5; the names are
-the registered experiments from §6.
+gate between phases. The letters (A–L) refer to the matrix in §5; most names are
+registered experiments from §6, while L is an ad-hoc override.
 
 ### Phase 0 — Plumbing / sanity (cheap, do first, don't skip)
 1. `cd model && python -m scripts.debug_vlsp` (the CPU smoke test).
@@ -421,10 +451,15 @@ the registered experiments from §6.
 9. **kl dial**: sweep `kl_weight ∈ {0, 1e-3, 1e-2}` on the best config while watching
    `source/source_vs_x0_mse`. This characterizes whether the source is a *hint*
    (mse stays up; DiT does the work) or *the answer* (mse → 0; DiT bypassed).
+10. **Source + dropout condition** (**L**, ad-hoc override): if B is too weak but
+    C is strong, train C with `action_conditioning.mode=dropout_video` and sweep
+    `dropout_prob ∈ {.1,.2,.5}`. This tests whether we can reduce over-reliance on
+    the direct cross-attention condition without imposing the full source-only
+    bottleneck.
 
 ### Phase 5 — Sweeps (lowest priority; only after Phases 2–3 are positive)
-10. On the winning config: blend `α∈{.25,.5,.75}` (**H**), dropout `p∈{.1,.2,.5}`
-    (**J**), residual scale (**I**), temperature (**K**), pooling
+11. On the winning config: blend `α∈{.25,.5,.75}` (**H**), source dropout
+    `p∈{.1,.2,.5}` (**J**), residual scale (**I**), temperature (**K**), pooling
     (`mean|attention|perceiver`). These are tuning, not validation of the claim.
 
 ### Minimal decisive set (if compute is tight): **A · C · B · F**

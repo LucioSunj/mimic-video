@@ -13,10 +13,12 @@ tensors -- no GPU / transformer-engine / dataset required.  Run with:
 It checks:
   1. the prior instantiates and returns sources of shape [B, HA, A];
   2. ``gaussian`` works without any video latent;
-  3. ``video_prior_sample`` works with a fake crossattn_emb;
-  4. ``zero_video`` / ``shuffled_video`` conditioning preserve shape;
-  5. ``video_prior_mean`` is deterministic for equal inputs;
-  6. source-prior checkpoints round-trip and old (empty) checkpoints load when
+  3. ``enabled=true, mode=gaussian`` is rejected as ambiguous;
+  4. ``video_prior_sample`` works with a fake crossattn_emb;
+  5. ``zero_video`` / ``shuffled_video`` conditioning preserve shape;
+  6. ``video_prior_mean`` is deterministic for equal inputs;
+  7. language-prior first-use and missing-language fallback are explicit;
+  8. source-prior checkpoints round-trip and old (empty) checkpoints load when
      the prior is disabled.
 """
 
@@ -103,13 +105,20 @@ def main() -> None:
     assert source.shape == SHAPE == x0.shape, source.shape
     assert torch.isfinite(source).all()
     assert sum(p.numel() for p in prior.parameters()) == 0, "disabled prior must carry no params"
-    print("[1/7] gaussian (disabled) -> shape", tuple(source.shape), "OK")
+    print("[1/9] gaussian (disabled) -> shape", tuple(source.shape), "OK")
+
+    try:
+        _build(enabled=True, mode="gaussian")
+        raise AssertionError("enabled=true with gaussian mode must be rejected")
+    except ValueError:
+        pass
+    print("[2/9] enabled=true + gaussian mode rejected OK")
 
     # gaussian determinism via seed (inference path uses arch_invariant_rand).
     s1, _ = prior(SHAPE, crossattn_emb=None, state_B_HO_O=None, context_timesteps_B_1=None, training=False, seed=3)
     s2, _ = prior(SHAPE, crossattn_emb=None, state_B_HO_O=None, context_timesteps_B_1=None, training=False, seed=3)
     assert torch.equal(s1, s2)
-    print("[2/7] gaussian seeded determinism OK")
+    print("[3/9] gaussian seeded determinism OK")
 
     # 4. video_prior_sample works with a fake crossattn_emb.
     prior = _build(enabled=True, mode="video_prior_sample", pool_type="attention")
@@ -123,12 +132,12 @@ def main() -> None:
     )
     assert source.shape == SHAPE and torch.isfinite(source).all()
     loss_prior, logs = compute_prior_regularization(metrics, prior.cfg)
-    print("[3/7] video_prior_sample -> shape", tuple(source.shape), "metrics:", sorted(metrics))
+    print("[4/9] video_prior_sample -> shape", tuple(source.shape), "metrics:", sorted(metrics))
 
     # pred shape sanity: u_t = source - x0 has the same shape as x0.
     pred_like = source - x0
     assert pred_like.shape == x0.shape
-    print("[4/7] u_t = source - x0 shape", tuple(pred_like.shape), "OK")
+    print("[5/9] u_t = source - x0 shape", tuple(pred_like.shape), "OK")
 
     # 5. zero_video / shuffled_video conditioning preserve shape.
     zero_c = apply_action_conditioning(crossattn, mode="zero_video")
@@ -137,7 +146,7 @@ def main() -> None:
     assert zero_c.shape == shuf_c.shape == norm_c.shape == crossattn.shape
     assert torch.count_nonzero(zero_c) == 0
     assert torch.equal(norm_c, crossattn)
-    print("[5/7] zero_video / shuffled_video conditioning preserve shape OK")
+    print("[6/9] zero_video / shuffled_video conditioning preserve shape OK")
 
     # 6. video_prior_mean is deterministic for equal inputs.
     prior = _build(enabled=True, mode="video_prior_mean", pool_type="mean")
@@ -146,9 +155,22 @@ def main() -> None:
         SHAPE, crossattn_emb=crossattn, state_B_HO_O=state, context_timesteps_B_1=ctx_t, training=False, seed=123
     )
     assert torch.equal(m1, m2), "video_prior_mean must be deterministic regardless of seed"
-    print("[6/7] video_prior_mean determinism OK")
+    print("[7/9] video_prior_mean determinism OK")
 
-    # 7. checkpoint round-trip + old/empty checkpoint into a disabled prior.
+    # use_language=True requires language on first forward, then tolerates missing
+    # language later while keeping lang_proj in the autograd graph.
+    prior = _build(enabled=True, mode="video_prior_mean", use_language=True)
+    try:
+        prior(SHAPE, crossattn_emb=crossattn, state_B_HO_O=state, context_timesteps_B_1=ctx_t, training=True)
+        raise AssertionError("use_language=True must require language on the first forward")
+    except ValueError:
+        pass
+    lang = torch.randn(B, 4, 32)
+    prior(SHAPE, crossattn_emb=crossattn, state_B_HO_O=state, context_timesteps_B_1=ctx_t, language_B_L_D=lang, training=True)
+    prior(SHAPE, crossattn_emb=crossattn, state_B_HO_O=state, context_timesteps_B_1=ctx_t, training=True)
+    print("[8/9] language prior initialization + missing-language fallback OK")
+
+    # 9. checkpoint round-trip + old/empty checkpoint into a disabled prior.
     enabled = _build(enabled=True, mode="video_prior_sample")
     sd = enabled.state_dict()
     reloaded = _build(enabled=True, mode="video_prior_sample")
@@ -156,7 +178,7 @@ def main() -> None:
     disabled = _build(enabled=False, mode="gaussian")
     res = disabled.load_state_dict({}, strict=False)
     assert len(res.missing_keys) == 0 and len(res.unexpected_keys) == 0
-    print(f"[7/7] ckpt round-trip ({len(sd)} keys) + empty-load-into-disabled OK")
+    print(f"[9/9] ckpt round-trip ({len(sd)} keys) + empty-load-into-disabled OK")
 
     # extra: every video mode x pool is finite and correctly shaped.
     for mode in [

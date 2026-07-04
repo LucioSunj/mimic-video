@@ -20,6 +20,7 @@ import torch
 from megatron.core import parallel_state
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, fully_shard
+from torch.nn.parameter import is_lazy
 
 from cosmos_predict2.configs.config_world2action import (
     World2ActionPipelineConfig,
@@ -57,6 +58,7 @@ class World2ActionPipeline(BasePipeline):
         # reproduces the Gaussian source, so nothing downstream changes.
         self.source_prior: ActionSourcePrior
         self.source_prior_ema: ActionSourcePrior | None = None
+        self.source_prior_dp_group = None
 
     @staticmethod
     def from_config(
@@ -184,6 +186,13 @@ class World2ActionPipeline(BasePipeline):
         self.dit.fully_shard(mesh=dp_mesh)
         self.dit = fully_shard(self.dit, mesh=dp_mesh, reshard_after_forward=True)
         broadcast_dtensor_model_states(self.dit, dp_mesh)
+        if self.source_prior_has_params:
+            # The source prior is intentionally small and replicated. Broadcast it
+            # here because FSDP runs are not wrapped in outer DDP.
+            self.source_prior_dp_group = dp_mesh.get_group("replicate")
+            broadcast_dtensor_model_states(self.source_prior, dp_mesh)
+            if self.source_prior_ema is not None:
+                broadcast_dtensor_model_states(self.source_prior_ema, dp_mesh)
         if self.dit_ema:
             self.dit_ema.fully_shard(mesh=dp_mesh)
             self.dit_ema = fully_shard(self.dit_ema, mesh=dp_mesh, reshard_after_forward=True)
@@ -381,8 +390,41 @@ class World2ActionPipeline(BasePipeline):
 
         return self.normalizer.norms["action/lowdim_concat"].unnormalize(sample_B_HA_A)
 
+    @staticmethod
+    @torch.no_grad()
+    def _cache_module_states(module: torch.nn.Module, is_cpu: bool = False) -> tuple[list[torch.Tensor | None], list[torch.Tensor]]:
+        device = "cpu" if is_cpu else None
+        params = [
+            None if is_lazy(param) else param.detach().clone().to(device=device)
+            for param in module.parameters()
+        ]
+        buffers = [buf.detach().clone().to(device=device) for buf in module.buffers()]
+        return params, buffers
+
+    @staticmethod
+    @torch.no_grad()
+    def _copy_module_states(src_model: torch.nn.Module, tgt_model: torch.nn.Module) -> None:
+        for src_param, tgt_param in zip(src_model.parameters(), tgt_model.parameters(), strict=False):
+            if is_lazy(src_param) or is_lazy(tgt_param):
+                continue
+            tgt_param.copy_(src_param.to(device=tgt_param.device, dtype=tgt_param.dtype))
+        for src_buf, tgt_buf in zip(src_model.buffers(), tgt_model.buffers(), strict=False):
+            tgt_buf.copy_(src_buf.to(device=tgt_buf.device, dtype=tgt_buf.dtype))
+
+    @staticmethod
+    @torch.no_grad()
+    def _restore_module_states(module: torch.nn.Module, states: tuple[list[torch.Tensor | None], list[torch.Tensor]]) -> None:
+        params, buffers = states
+        for cached, param in zip(params, module.parameters(), strict=False):
+            if cached is None:
+                continue
+            param.copy_(cached.to(device=param.device, dtype=param.dtype))
+        for cached, buf in zip(buffers, module.buffers(), strict=False):
+            buf.copy_(cached.to(device=buf.device, dtype=buf.dtype))
+
     @contextmanager
     def ema_scope(self, context: None, is_cpu: bool = False):
+        source_prior_cache = None
         if self.config.ema.enabled:
             # https://github.com/pytorch/pytorch/issues/144289
             for module in self.dit.modules():
@@ -390,6 +432,9 @@ class World2ActionPipeline(BasePipeline):
                     module.reshard()
             self.dit_ema_worker.cache(self.dit.parameters(), is_cpu=is_cpu)
             self.dit_ema_worker.copy_to(src_model=self.dit_ema, tgt_model=self.dit)
+            if self.source_prior_ema is not None:
+                source_prior_cache = self._cache_module_states(self.source_prior, is_cpu=is_cpu)
+                self._copy_module_states(self.source_prior_ema, self.source_prior)
             if context is not None:
                 log.info(f"{context}: Switched to EMA weights")
         try:
@@ -400,5 +445,7 @@ class World2ActionPipeline(BasePipeline):
                     if isinstance(module, FSDPModule):
                         module.reshard()
                 self.dit_ema_worker.restore(self.dit.parameters())
+                if source_prior_cache is not None:
+                    self._restore_module_states(self.source_prior, source_prior_cache)
                 if context is not None:
                     log.info(f"{context}: Restored training weights")
