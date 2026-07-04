@@ -75,14 +75,24 @@ class IterSpeed(EveryN):
     @staticmethod
     def _format_scalar_summary(scalars: dict[str, float]) -> str:
         keys = [
+            "probe/sampled_action_mse_gtvid",
             "loss/flow",
             "loss/source_prior",
+            "loss/source_kl",
             "source/source_vs_x0_mse",
+            "source/source_vs_x0_over_var",
             "source/source_vs_gaussian_mse",
             "source/source_vs_gaussian_ratio",
+            "source/mu_vs_x0_mse",
+            "source/source_vs_mu_mse",
             "source/std_mean",
+            "source/std_min",
             "source/logstd_mean",
+            "source/logstd_floor_frac",
+            "source/logstd_ceiling_frac",
             "source/mu_std",
+            "source/mu_batch_std",
+            "source/mu_horizon_std",
             "Var_inst[x_0]",
         ]
         parts = []

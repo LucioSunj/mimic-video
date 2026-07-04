@@ -135,12 +135,26 @@ for video_ckpt, data_config, xattn_layer_idx, lr, bsz in it.product(
 #  `model.config.pipe_config.action_conditioning.*` overrides on the CLI       #
 #  (see VLSP.md).                                                              #
 # --------------------------------------------------------------------------- #
+VLSP_DIAG_MODEL_CONFIG: dict = {"sampled_mse_probe_interval": 500}
+VLSP_DIAG_TRAINER_CONFIG: dict = {"logging_iter": 500}
+VLSP_DIAG_CHECKPOINT_CONFIG: dict = {"save_iter": 5_000}
+
+
+def _merge_dicts(base: dict, override: dict | None) -> dict:
+    merged = copy.deepcopy(base)
+    if override:
+        merged.update(override)
+    return merged
+
+
 def _vlsp_variant(
     *,
     mode: str,
     conditioning: str = "normal",
     enabled: bool | None = None,
     model_config: dict | None = None,
+    trainer_config: dict | None = None,
+    checkpoint_config: dict | None = None,
     **prior_kwargs,
 ) -> dict:
     """Build the pipe_config overrides for one VLSP variant.
@@ -156,7 +170,9 @@ def _vlsp_variant(
     return {
         "action_source_prior": action_source_prior,
         "action_conditioning": {"mode": conditioning},
-        "model_config": model_config or {},
+        "model_config": _merge_dicts(VLSP_DIAG_MODEL_CONFIG, model_config),
+        "trainer_config": _merge_dicts(VLSP_DIAG_TRAINER_CONFIG, trainer_config),
+        "checkpoint_config": _merge_dicts(VLSP_DIAG_CHECKPOINT_CONFIG, checkpoint_config),
     }
 
 
@@ -215,6 +231,34 @@ VLSP_VARIANTS: dict[str, dict] = {
         source_dropout_prob=0.20,
         model_config={"sampled_mse_probe_interval": 500},
     ),
+    # ------------------------------------------------------------------ #
+    # Next diagnostic sweep: isolate whether raising the variance floor is
+    # enough, and keep KL/blend controls in the same logging/checkpoint regime.
+    # ------------------------------------------------------------------ #
+    "vlsp_next_floor_m2": _vlsp_variant(
+        mode="video_prior_sample",
+        conditioning="normal",
+        logstd_min=-2.0,
+    ),
+    "vlsp_next_kl_floor_m2": _vlsp_variant(
+        mode="video_prior_sample",
+        conditioning="normal",
+        logstd_min=-2.0,
+        kl_weight=1e-3,
+    ),
+    "vlsp_next_blend050_kl_floor_m2": _vlsp_variant(
+        mode="video_prior_blend",
+        conditioning="normal",
+        blend_alpha=0.5,
+        logstd_min=-2.0,
+        kl_weight=1e-3,
+    ),
+    "vlsp_next_mean_floor_m2": _vlsp_variant(
+        mode="video_prior_mean",
+        conditioning="normal",
+        logstd_min=-2.0,
+        kl_weight=1e-3,
+    ),
 }
 
 if vlsp_base_cfg is not None:
@@ -226,6 +270,10 @@ if vlsp_base_cfg is not None:
         vlsp_cfg["model"]["config"]["pipe_config"]["action_conditioning"] = overrides["action_conditioning"]
         for extra_key, extra_val in overrides.get("model_config", {}).items():
             vlsp_cfg["model"]["config"][extra_key] = copy.deepcopy(extra_val)
+        for extra_key, extra_val in overrides.get("trainer_config", {}).items():
+            vlsp_cfg["trainer"][extra_key] = copy.deepcopy(extra_val)
+        for extra_key, extra_val in overrides.get("checkpoint_config", {}).items():
+            vlsp_cfg["checkpoint"][extra_key] = copy.deepcopy(extra_val)
         cs.store(
             group="experiment",
             package="_global_",

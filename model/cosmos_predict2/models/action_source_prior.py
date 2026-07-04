@@ -518,18 +518,28 @@ class ActionSourcePrior(nn.Module):
         with torch.no_grad():
             metrics["source/mu_mean"] = mu.mean()
             metrics["source/mu_std"] = mu.std()
+            metrics["source/mu_abs_mean"] = mu.abs().mean()
+            metrics["source/mu_rms"] = mu.float().pow(2).mean().sqrt()
             # Run-1 lesson: mu.std() is a GLOBAL std over [B, HA, A] and cannot
             # distinguish "mu varies with the video" from "one fixed trajectory
             # for every video".  mu_batch_std is the std ACROSS THE BATCH per
             # (step, dim), averaged — ~0 means the prior ignores its input.
             metrics["source/mu_batch_std"] = mu.float().std(dim=0, unbiased=False).mean()
+            metrics["source/mu_horizon_std"] = mu.float().std(dim=1, unbiased=False).mean()
             metrics["source/logstd_mean"] = logstd.mean()
+            metrics["source/logstd_min"] = logstd.min()
+            metrics["source/logstd_max"] = logstd.max()
             # Fraction of logstd pinned at the clamp floor — variance-collapse
             # alarm (run 1 sat at 1.0 with logstd_min=-5 for the entire run).
             metrics["source/logstd_floor_frac"] = (
                 (logstd <= float(self.cfg.logstd_min) + 0.05).float().mean()
             )
+            metrics["source/logstd_ceiling_frac"] = (
+                (logstd >= float(self.cfg.logstd_max) - 0.05).float().mean()
+            )
             metrics["source/std_mean"] = std.mean()
+            metrics["source/std_min"] = std.min()
+            metrics["source/std_max"] = std.max()
         return self._finalize(source, shape, x0_B_HA_A, metrics, mode, randn)
 
     # ------------------------------------------------------------------ #
@@ -556,19 +566,34 @@ class ActionSourcePrior(nn.Module):
             device = source.device
             metrics.setdefault("source/mu_mean", torch.zeros((), device=device))
             metrics.setdefault("source/mu_std", torch.zeros((), device=device))
+            metrics.setdefault("source/mu_abs_mean", torch.zeros((), device=device))
+            metrics.setdefault("source/mu_rms", torch.zeros((), device=device))
             metrics.setdefault("source/mu_batch_std", torch.zeros((), device=device))
+            metrics.setdefault("source/mu_horizon_std", torch.zeros((), device=device))
             metrics.setdefault("source/logstd_mean", torch.zeros((), device=device))
+            metrics.setdefault("source/logstd_min", torch.zeros((), device=device))
+            metrics.setdefault("source/logstd_max", torch.zeros((), device=device))
             metrics.setdefault("source/logstd_floor_frac", torch.zeros((), device=device))
+            metrics.setdefault("source/logstd_ceiling_frac", torch.zeros((), device=device))
             metrics.setdefault("source/std_mean", torch.ones((), device=device))
+            metrics.setdefault("source/std_min", torch.ones((), device=device))
+            metrics.setdefault("source/std_max", torch.ones((), device=device))
             metrics.setdefault("source/shuffle_enabled", torch.zeros((), device=device))
             metrics.setdefault("source/dropout_rate_actual", torch.zeros((), device=device))
             metrics["source/source_mean"] = source.mean()
             metrics["source/source_std"] = source.std()
+            metrics["source/source_abs_mean"] = source.abs().mean()
+            metrics["source/source_rms"] = source.float().pow(2).mean().sqrt()
             metrics["source/source_mode_id"] = torch.as_tensor(
                 float(SOURCE_MODE_IDS.get(mode, -1)), device=device
             )
+            mu = metrics.get("mu")
+            if torch.is_tensor(mu):
+                metrics["source/source_vs_mu_mse"] = F.mse_loss(source, mu.float())
             if x0_B_HA_A is not None:
                 metrics["source/source_vs_x0_mse"] = F.mse_loss(source, x0_B_HA_A.float())
+                if torch.is_tensor(mu):
+                    metrics["source/mu_vs_x0_mse"] = F.mse_loss(mu.float(), x0_B_HA_A.float())
             metrics["source/source_vs_gaussian_mse"] = F.mse_loss(source, randn(shape))
         return source, metrics
 

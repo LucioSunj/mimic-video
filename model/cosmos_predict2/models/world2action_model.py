@@ -488,6 +488,16 @@ class World2ActionModel(ImaginaireModel):
                     if key in ("mu", "logstd"):
                         continue  # tensors used for regularization only
                     scalars[key] = val
+                eps = torch.as_tensor(1e-8, device=x0_B_HA_A.device)
+                source_vs_x0 = source_metrics.get("source/source_vs_x0_mse")
+                source_vs_gaussian = source_metrics.get("source/source_vs_gaussian_mse")
+                mu_vs_x0 = source_metrics.get("source/mu_vs_x0_mse")
+                if torch.is_tensor(source_vs_x0):
+                    scalars["source/source_vs_x0_over_var"] = source_vs_x0 / (var_inst_x0 + eps)
+                if torch.is_tensor(mu_vs_x0):
+                    scalars["source/mu_vs_x0_over_var"] = mu_vs_x0 / (var_inst_x0 + eps)
+                if torch.is_tensor(source_vs_x0) and torch.is_tensor(source_vs_gaussian):
+                    scalars["source/source_vs_gaussian_ratio"] = source_vs_x0 / (source_vs_gaussian + eps)
                 cond_mode = self.pipe.config.action_conditioning.mode
                 scalars["condition/mode_id"] = torch.as_tensor(
                     float(COND_MODE_IDS.get(cond_mode, -1)), device=loss.device
