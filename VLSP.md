@@ -393,7 +393,15 @@ Reading their code directly shaped several VLSP design decisions.
    keeping both decodable). VLSP currently offers KL / mean-L2 / std regularizers
    (default 0). **Recommendation**: for `video_prior_*` modes set a small
    `kl_weight` (e.g. `1e-3`) and watch `source/source_vs_x0_mse`; an optional
-   VITA-style consistency anchor is a natural extension.
+   VITA-style consistency anchor is a natural extension. Important nuance:
+   variance collapse (`logstd → logstd_min`) is a real warning sign but not
+   automatically proof that the policy has no usable signal. In source+condition
+   runs it can still act like a deterministic video-informed source / lower-
+   variance endpoint and improve action generation; the failure mode is when the
+   source becomes task-independent or the action decoder cannot recover from the
+   off-manifold source. Use rollout success, sampled action MSE, source
+   input-sensitivity metrics, and shuffled controls to separate "useful collapsed
+   source" from "collapsed shortcut".
 5. **Endpoint convention.** A2A/VITA (torchcfm) put the source at `t=0` and data
    at `t=1`; mimic-video puts data at `t=0` and the source at `t=1` (the sampler
    integrates `t: 1→0`). VLSP places the learned source at mimic-video's `t=1`
@@ -486,13 +494,33 @@ a bonus.
 
 ## 12. Run log
 
-- **Run 1 (2026-07, LIBERO-goal, B & C with kl=0) — FAILED: fixed
-  task-independent actions.** Root cause: source-prior **variance collapse**
-  (logstd pinned at the −5 floor ⇒ Dirac source) with a suspected
-  input-independent mu; the early "10× faster loss" was this collapse, not
-  learning. Full evidence, three pre-retraining diagnostics
-  (`scripts/vlsp_probe_prior.py`), the Run-2 plan (R1 `vlsp_r1_kl_1e3` /
-  R2 `vlsp_r2_blend_050` / R3 `vlsp_r3_kl_dropout_020`), in-training gates and
-  the new collapse metrics are documented in
-  **[VLSP_RUN1_ANALYSIS.md](VLSP_RUN1_ANALYSIS.md)** — read it before launching
-  any new VLSP run.
+- **Run 1 (2026-07, LIBERO-goal, B & C with kl=0) — revised status after eval
+  setup audit.** The original evaluation setup overstated the failure as fixed,
+  task-independent actions. With the corrected setup, **source+condition (C) can
+  generate task-conditioned actions**, but the LIBERO-goal success rate is still
+  not high. **Source-only (B) remains essentially not viable** in this setting:
+  actions look strange and the zeroed action-condition bottleneck appears too
+  severe. The training-time observation is still valid: `logstd` collapses to
+  the −5 floor, turning the sampled source into an almost deterministic endpoint.
+  The interpretation is therefore weaker and more useful than the first
+  post-mortem: collapse is a risk and must be monitored, but in C it may still
+  provide a beneficial deterministic / low-variance video-informed source rather
+  than being purely harmful. Treat **C vs A** and **C vs shuffled-source** as the
+  decisive tests; treat B as a strict bottleneck diagnostic, not the main
+  performance candidate.
+
+- The original post-mortem in **[VLSP_RUN1_ANALYSIS.md](VLSP_RUN1_ANALYSIS.md)**
+  remains useful for collapse diagnostics (`source/logstd_floor_frac`,
+  `source/mu_batch_std`, `probe/sampled_action_mse_gtvid`) and the Run-2
+  anti-collapse variants (R1 `vlsp_r1_kl_1e3`, R2 `vlsp_r2_blend_050`, R3
+  `vlsp_r3_kl_dropout_020`), but its eval-failure verdict should be read with
+  the correction above.
+
+- **2026-07-05 — active plan: [VLSP_EXECUTION_PLAN.md](VLSP_EXECUTION_PLAN.md).**
+  Supersedes the R1–R3 launch order above and pauses §11 Phases 2–5 until its
+  decision node is resolved. Order: eval/config parity audit (Q0) → E0 oracle
+  probe (Q1) → D2 μ-informativeness on B/C checkpoints (Q2) → A′ baseline eval
+  + source-ablation grid + solver/D3 (Q3) → decision node → revised Run-2
+  (R1′ fixed-σ control, R5′ μ-aux + structured co-dropout main run, R2 blend
+  fallback). Do not launch unmodified R1, σ-free R4, or full FastWAM training
+  before the corresponding gates in that plan pass.
